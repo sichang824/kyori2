@@ -5,7 +5,7 @@ import re
 import socket
 import subprocess
 from pathlib import Path
-from paramiko import (Transport, RSAKey, SFTPClient, SSHClient)
+from paramiko import (Transport, RSAKey, SFTPClient, SSHClient, AutoAddPolicy)
 
 from kyori2.command import Command
 from kyori2 import logger
@@ -81,13 +81,12 @@ class Local(CommonCommandUtil):
 
         if out:
             cmd.output = out
-        # verbose开关
         elif err:
             cmd.error = err
 
+        cmd.status_code = int(p.wait())
         logger.debug(out)
         logger.debug(err)
-        cmd.status_code = int(p.wait())
         logger.debug(cmd.status_code)
 
     def getcwd(self):
@@ -101,26 +100,30 @@ class RemoteHost(Transport, CommonCommandUtil):
                  hostname,
                  user="root",
                  password=None,
-                 key=None,
+                 pkey=None,
                  port=22,
                  label="default"):
 
         self.port = port
         self.hostname = hostname
-
         self._sock = (hostname, port)
-
         self.user = user
         self.label = label
-        self.key = key
         self.password = password
 
+        if pkey:
+            self.pkey = RSAKey.from_private_key(open(pkey))
+
         self.connected = False
-        self.debug_info = None
 
     def __str__(self):
-        return "<RemoteHost: {}:{}@{}>".format(self.label, self.user,
-                                               self.hostname)
+        return f"<RemoteHost: {self.label}:{self.user}@{ self.hostname}>"
+
+    def __repr__(self) -> str:
+        return f"<RemoteHost: {self.label}:{self.user}@{ self.hostname}>"
+
+    def __del__(self):
+        self.close()
 
     @property
     def sftp(self) -> SFTPClient:
@@ -129,6 +132,7 @@ class RemoteHost(Transport, CommonCommandUtil):
     @property
     def ssh(self) -> SSHClient:
         ssh = SSHClient()
+        ssh.set_missing_host_key_policy(AutoAddPolicy())
         ssh._transport = self
         return ssh
 
@@ -146,17 +150,11 @@ class RemoteHost(Transport, CommonCommandUtil):
         return flag
 
     def initial(self) -> bool:
-        # SSHClient.set_missing_host_key_policy(AutoAddPolicy())
-        succ = "SSH connect succeed:{}".format(self)
-        fail = "SSH connect failed:{}".format(self)
 
         if self.password:
             info = {"username": self.user, "password": self.password}
-        elif self.key:
-            info = {
-                "username": self.user,
-                "pkey": RSAKey.from_private_key_file(self.key)
-            }
+        elif self.pkey:
+            info = {"username": self.user, "pkey": self.pkey}
         else:
             return self.connected
 
@@ -164,19 +162,16 @@ class RemoteHost(Transport, CommonCommandUtil):
             super().__init__(self._sock)
             self.connect(**info)
             self.connected = True
-            logger.debug(succ)
-
+            logger.debug(f"SSH connect succeed:{self}")
         except Exception as e:
             self.connected = False
-            self.debug_info = "{}, {}".format(fail, e)
-            logger.exception(fail, e)
+            logger.exception(f"SSH connect failed:{self}", e)
 
         if self.connected:
             # 密码过期检查
             cmd = Command("ls", stringify=True)
             self.execute(cmd)
             if "expired" in cmd.error:
-                self.debug_info = "{}, {}".format(fail, cmd.error)
                 self.connected = False
 
         return self.connected
@@ -209,15 +204,13 @@ class RemoteHost(Transport, CommonCommandUtil):
         try:
             stdin, stdout, stderr = self.ssh.exec_command(cmd.content,
                                                           timeout=timeout)
-            out = stdout.read()
-            err = stderr.read()
+            out, err = stdout.read(), stderr.read()
             if cmd.stringify:
                 out = out.decode()
                 err = err.decode()
             logger.debug(out)
             logger.debug(err)
-            cmd.output = out
-            cmd.error = err
+            cmd.output, cmd.error = out, err
             cmd.status_code = int(stdout.channel.recv_exit_status())
             logger.debug(cmd.status_code)
         except Exception as e:
@@ -227,30 +220,18 @@ class RemoteHost(Transport, CommonCommandUtil):
             logger.exception(cmd.error, e)
 
     def exec(self, cmd, real_time=False, timeout=30):
-        logger.debug(cmd.cwd)
+        logger.debug(f"work dir: {cmd.cwd}")
+
         if cmd.cwd:
             cmd.content = """cd '{}' && """.format(cmd.cwd) + cmd.content
 
-        msg = "Server execute {} on {}".format(cmd, self)
-        logger.debug(msg)
+        logger.debug(f"Server execute {cmd} on {self}")
         if real_time:
             self.exec_real_time(cmd, timeout)
         else:
             self.exec_wait(cmd, timeout)
 
-    def dir_exist(self, fd):
-        """检查目录是否存在"""
-        try:
-            self.sftp.stat(fd)
-            return True
-        except IOError:
-            return False
-
     def close(self):
-        disconnected = "Server disconnected:{}".format(self)
         self.connected = False
         super(RemoteHost, self).close()
-        logger.debug(disconnected)
-
-    def __del__(self):
-        self.close()
+        logger.debug(f"Server disconnected:{self}")
