@@ -68,26 +68,17 @@ class Local(CommonCommandUtil):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            out = p.stdout.read()
-            err = p.stderr.read()
+            out, err, ret = p.stdout.read(), p.stderr.read(), int(p.wait())
         except Exception as e:
             cmd.exception = e
+            cmd.status_code = 1
             logger.debug(cmd.exception)
             return
 
-        if cmd.stringify:
-            out = out.decode()
-            err = err.decode()
+        logger.debug(f"Return code: {cmd.status_code}, out: {out}, err: {err}")
 
-        if out:
-            cmd.output = out
-        elif err:
-            cmd.error = err
-
-        cmd.status_code = int(p.wait())
-        logger.debug(out)
-        logger.debug(err)
-        logger.debug(cmd.status_code)
+        if cmd.stringify: out, err = out.decode(), err.decode()
+        cmd.output, cmd.error, cmd.status_code = out, err, ret
 
     def getcwd(self):
         return self.exec("pwd")
@@ -114,6 +105,7 @@ class RemoteHost(Transport, CommonCommandUtil):
         if pkey:
             self.pkey = RSAKey.from_private_key(open(pkey))
 
+        self.active = False
         self.connected = False
 
     def __str__(self):
@@ -150,27 +142,28 @@ class RemoteHost(Transport, CommonCommandUtil):
         return flag
 
     def initial(self) -> bool:
-
+        info = {"username": self.user}
         if self.password:
-            info = {"username": self.user, "password": self.password}
+            info.update({"password": self.password})
         elif self.pkey:
-            info = {"username": self.user, "pkey": self.pkey}
+            info.update({"pkey": self.pkey})
         else:
             return self.connected
 
         try:
             super().__init__(self._sock)
+            logger.debug(info)
             self.connect(**info)
             self.connected = True
             logger.debug(f"SSH connect succeed:{self}")
         except Exception as e:
             self.connected = False
-            logger.exception(f"SSH connect failed:{self}", e)
+            logger.exception(f"SSH connect failed:{self}, {e}")
 
         if self.connected:
             # 密码过期检查
-            cmd = Command("ls", stringify=True)
-            self.execute(cmd)
+            cmd = Command("uptime", stringify=True)
+            self.exec(cmd)
             if "expired" in cmd.error:
                 self.connected = False
 
@@ -205,19 +198,18 @@ class RemoteHost(Transport, CommonCommandUtil):
             stdin, stdout, stderr = self.ssh.exec_command(cmd.content,
                                                           timeout=timeout)
             out, err = stdout.read(), stderr.read()
-            if cmd.stringify:
-                out = out.decode()
-                err = err.decode()
-            logger.debug(out)
-            logger.debug(err)
-            cmd.output, cmd.error = out, err
-            cmd.status_code = int(stdout.channel.recv_exit_status())
-            logger.debug(cmd.status_code)
+            ret = int(stdout.channel.recv_exit_status())
         except Exception as e:
             cmd.output = ""
             cmd.error = f"Server execute command failed: {e}"
             cmd.status_code = 1
-            logger.exception(cmd.error, e)
+            logger.exception(cmd.error)
+            return
+
+        logger.debug(f"Return code: {ret}, out: {out}, err: {err}")
+
+        if cmd.stringify: out, err = out.decode(), err.decode()
+        cmd.output, cmd.error, cmd.status_code = out, err, ret
 
     def exec(self, cmd, real_time=False, timeout=30):
         logger.debug(f"work dir: {cmd.cwd}")
@@ -234,4 +226,4 @@ class RemoteHost(Transport, CommonCommandUtil):
     def close(self):
         self.connected = False
         super(RemoteHost, self).close()
-        logger.debug(f"Server disconnected:{self}")
+        logger.debug(f"Server disconnected: {self}")
