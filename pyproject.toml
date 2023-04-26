@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling","paramiko","pathlib"]
+build-backend = "hatchling.build"
+
+
+[project]
+name = "kyori2"
+version = "0.1.0"
+authors = [
+  { name="sichangzhao", email="sichangzhao@tencent.com" },
+]
+description = "A small command execute program"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://git.code.tencent.com/andrew75567/kyori2.git"
+"Bug Tracker" = "https://git.code.tencent.com/andrew75567/kyori2/issues"
