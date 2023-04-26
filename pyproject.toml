@@ -19,5 +19,5 @@ classifiers = [
 ]
 
 [project.urls]
-"Homepage" = "https://git.code.tencent.com/andrew75567/kyori2.git"
-"Bug Tracker" = "https://git.code.tencent.com/andrew75567/kyori2/issues"
+"Homepage" = "https://github.com/sichang824/kyori2.git"
+"Bug Tracker" = "https://github.com/sichang824/kyori2/issues"
