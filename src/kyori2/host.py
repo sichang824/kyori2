@@ -5,8 +5,10 @@ import re
 import socket
 import subprocess
 from pathlib import Path
-from paramiko import (Transport, RSAKey, SFTPClient, SSHClient, AutoAddPolicy)
-
+from paramiko import (RSAKey, SFTPClient, SSHClient, AutoAddPolicy)
+from errno import ECONNREFUSED, EHOSTUNREACH
+from paramiko.ssh_exception import (BadHostKeyException,
+                                    NoValidConnectionsError)
 from kyori2.command import Command
 from kyori2 import logger
 
@@ -14,6 +16,69 @@ __all__ = ["Local", "RemoteHost"]
 
 
 class CommonCommandUtil:
+
+    def families_and_addresses(self, hostname, port):
+        """
+        Yield pairs of address families and addresses to try for connecting.
+
+        :param str hostname: the server to connect to
+        :param int port: the server port to connect to
+        :returns: Yields an iterable of ``(family, address)`` tuples
+        """
+        guess = True
+        addrinfos = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC,
+                                       socket.SOCK_STREAM)
+        for (family, socktype, proto, canonname, sockaddr) in addrinfos:
+            if socktype == socket.SOCK_STREAM:
+                yield family, sockaddr
+                guess = False
+
+        # some OS like AIX don't indicate SOCK_STREAM support, so just
+        # guess. :(  We only do this if we did not get a single result marked
+        # as socktype == SOCK_STREAM.
+        if guess:
+            for family, _, _, _, sockaddr in addrinfos:
+                yield family, sockaddr
+
+    def check_connectivity(self, hostname, port, retries=1, timeout=1):
+
+        errors = {}
+        to_try = list(self.families_and_addresses(hostname, 1234)) * retries
+        for af, addr in to_try:
+            try:
+                sock = socket.socket(af, socket.SOCK_STREAM)
+                if timeout is not None:
+                    try:
+                        sock.settimeout(timeout)
+                    except:
+                        pass
+                assert sock.connect_ex(addr) == 0
+                # Break out of the loop on success
+                break
+            except socket.error as e:
+                # As mentioned in socket docs it is better
+                # to close sockets explicitly
+                if sock:
+                    sock.close()
+                # Raise anything that isn't a straight up connection error
+                # (such as a resolution error)
+                if e.errno not in (ECONNREFUSED, EHOSTUNREACH):
+                    raise
+                # Capture anything else so we know how the run looks once
+                # iteration is complete. Retain info about which attempt
+                # this was.
+                errors[addr] = e
+
+        # Make sure we explode usefully if no address family attempts
+        # succeeded. We've no way of knowing which error is the "right"
+        # one, so we construct a hybrid exception containing all the real
+        # ones, of a subclass that client code should still be watching for
+        # (socket.error)
+
+        if len(errors) == len(to_try):
+            raise NoValidConnectionsError(errors)
+
+        return True
 
     def md5sum(self, path):
         cmd = Command(f"md5sum '{path}'", stringify=True)
@@ -84,7 +149,7 @@ class Local(CommonCommandUtil):
         return self.exec("pwd")
 
 
-class RemoteHost(Transport, CommonCommandUtil):
+class RemoteHost(SSHClient, CommonCommandUtil):
     __slots__ = ("hostname", "port", "username", "password", "connected")
 
     def __init__(self,
@@ -93,20 +158,25 @@ class RemoteHost(Transport, CommonCommandUtil):
                  password=None,
                  pkey=None,
                  port=22,
-                 label="default"):
+                 label="default") -> None:
 
         self.port = port
         self.hostname = hostname
-        self._sock = (hostname, port)
         self.user = user
         self.label = label
         self.password = password
 
+        self.connected = False
+        self._sock = (hostname, int(port))
+        self._ssh = None
+        self._sftp = None
+
+        super().__init__()
+
+        # 需要再之后进行设置
         if pkey:
             self.pkey = RSAKey.from_private_key(open(pkey))
-
-        self.active = False
-        self.connected = False
+        self.set_missing_host_key_policy(AutoAddPolicy())
 
     def __str__(self):
         return f"<RemoteHost: {self.label}:{self.user}@{ self.hostname}>"
@@ -117,57 +187,58 @@ class RemoteHost(Transport, CommonCommandUtil):
     def __del__(self):
         self.close()
 
-    @property
-    def sftp(self) -> SFTPClient:
-        return SFTPClient.from_transport(self)
+    def connect(self) -> None:
+        info = {
+            "hostname": self.hostname,
+            "username": self.user,
+            "port": self.port,
+            "timeout": 3,  # tcp timeout
+            "auth_timeout": 3,
+            "banner_timeout": 3,
+        }
 
-    @property
-    def ssh(self) -> SSHClient:
-        ssh = SSHClient()
-        ssh.set_missing_host_key_policy(AutoAddPolicy())
-        ssh._transport = self
-        return ssh
+        logger.debug(f"SSH connect: {info}")
 
-    def check_connectivity(self, timeout=1):
-        flag = True
-        skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        skt.settimeout(timeout)
-        try:
-            skt.connect(self._sock)
-            skt.shutdown(socket.SHUT_RDWR)
-        except Exception as e:
-            flag = False
-        finally:
-            skt.close()
-        return flag
-
-    def initial(self) -> bool:
-        info = {"username": self.user}
         if self.password:
             info.update({"password": self.password})
         elif self.pkey:
             info.update({"pkey": self.pkey})
         else:
-            return self.connected
+            raise BadHostKeyException(self.hostname, None, None)
 
-        try:
-            super().__init__(self._sock)
-            logger.debug(info)
-            self.connect(**info)
-            self.connected = True
-            logger.debug(f"SSH connect succeed:{self}")
-        except Exception as e:
-            self.connected = False
-            logger.exception(f"SSH connect failed:{self}, {e}")
+        super().connect(**info)
+        self.connected = True
 
         if self.connected:
-            # 密码过期检查
-            cmd = Command("uptime", stringify=True)
-            self.exec(cmd)
-            if "expired" in cmd.error:
-                self.connected = False
+            self.check_expired()
 
-        return self.connected
+    @property
+    def sftp(self) -> SFTPClient:
+        return SFTPClient.from_transport(self.get_transport())
+
+    @property
+    def ssh(self) -> SSHClient:
+        return self
+
+    def check_expired(self):
+        # 密码过期检查
+        cmd = Command("uptime", stringify=True)
+        self.exec(cmd)
+        if "expired" in cmd.error:
+            self.close()
+            self.connected = False
+            raise Exception("password expired.")
+
+    def check_connectivity(self, timeout=3):
+        super().check_connectivity(self.hostname, self.port, timeout)
+
+        cmd = Command("uptime", stringify=True)
+        try:
+            self.exec(cmd, timeout=3)
+            return True
+        except:
+            self.close()
+            return False
 
     def validate(self):
         if not self.is_ip(self.hostname):
@@ -224,6 +295,8 @@ class RemoteHost(Transport, CommonCommandUtil):
             self.exec_wait(cmd, timeout)
 
     def close(self):
+        self._ssh = None
+        self._sftp = None
         self.connected = False
-        super(RemoteHost, self).close()
         logger.debug(f"Server disconnected: {self}")
+        return super().close()
