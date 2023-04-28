@@ -235,10 +235,12 @@ class RemoteHost(SSHClient, CommonCommandUtil):
         cmd = Command("uptime", stringify=True)
         try:
             self.exec(cmd, timeout=3)
-            return True
+            if cmd.exception:
+                return False
         except:
             self.close()
             return False
+        return True
 
     def validate(self):
         if not self.is_ip(self.hostname):
@@ -274,6 +276,7 @@ class RemoteHost(SSHClient, CommonCommandUtil):
             cmd.output = ""
             cmd.error = f"Server execute command failed: {e}"
             cmd.status_code = 1
+            cmd.exception = e
             logger.exception(cmd.error)
             return
 
